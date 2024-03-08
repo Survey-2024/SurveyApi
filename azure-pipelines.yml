@@ -1,0 +1,119 @@
+trigger:
+- main
+
+variables:
+- group: 'PipelinePw'
+- name: buildConfiguration
+  value: 'Release'
+- name: vmImageName
+  value: 'windows-latest'
+- name: subscription
+  value: 'SurveyPipelineServiceConnection'
+- name: System.Debug
+  value: true
+
+stages:
+- stage: Build
+  displayName: Build stage
+
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+
+    steps:
+
+    - task: NuGetToolInstaller@1
+
+    # Restore project
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet restore'
+      inputs:
+        command: 'custom'
+        custom: 'restore'
+
+    # Build project
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet build'
+      inputs:
+        command: 'custom'
+        custom: 'build'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: CmdLine@2
+      displayName: 'dotnet New Tool Manifest'
+      inputs:
+        script: |
+          dotnet new tool-manifest
+          dotnet tool install SwashBuckle.AspNetCore.Cli
+
+    - task: CmdLine@2
+      displayName: 'dotnet Generate Swagger File'
+      env:
+        AZURE_CLIENT_SECRET: $(SurveyPipelineSPPW)
+        AZURE_CLIENT_ID: 11f8fd92-1414-4e2b-bd94-95d30f46f10c
+        AZURE_TENANT_ID: 19d60940-7539-479d-8ea3-e90ee80dfe9b
+        AZURE_SUBSCRIPTION_ID: 146f2515-80c9-4a78-ae5d-452e9a3d7255
+      inputs:
+        script: |
+          dotnet swagger tofile --output $(Build.ArtifactStagingDirectory)/swagger.json $(Build.SourcesDirectory)/SurveyApi/bin/Release/net8.0/SurveyApi.dll v1
+
+    # Publish projects to specified folder.
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet publish'
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration) -o $(Build.ArtifactStagingDirectory)'
+        zipAfterPublish: true
+
+    - task: PublishBuildArtifacts@1
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  condition: succeeded()
+
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    environment: 'development'
+    pool:
+      vmImage: $(vmImageName)
+
+    strategy:
+      runOnce:
+        deploy:
+
+          steps:
+
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              downloadPath: $(Build.ArtifactStagingDirectory)
+
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: $(subscription)
+              appType: 'webApp'
+              appName: 'SurveyApiCjd'
+              package: '$(Build.ArtifactStagingDirectory)/**/*.zip'
+              deploymentMethod: 'auto'
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(subscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az apim api import \
+                  --service-url "https://surveyapicjd.azurewebsites.net" \
+                  --resource-group "rg-docreader" \
+                  --service-name "SurveyApiManagement" \
+                  --api-id "SurveyApi" \
+                  --path "" \
+                  --specification-format "OpenApi" \
+                  --api-type "http" \
+                  --specification-path "$(Build.ArtifactStagingDirectory)\drop\swagger.json" \
+                  --display-name "SurveyApi $(Build.BuildNumber)" \
